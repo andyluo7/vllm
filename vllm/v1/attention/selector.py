@@ -66,6 +66,14 @@ def get_attn_backend(
             f"Valid values are: {valid_cache_dtypes}"
         )
 
+    # Force TurboQuant backend when kv_cache_dtype is "turboquant"
+    if kv_cache_dtype == "turboquant":
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        logger.info("Using TurboQuant attention backend for turboquant "
+                     "KV cache dtype.")
+        return AttentionBackendEnum.TURBOQUANT_ATTN.get_class()
+
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
