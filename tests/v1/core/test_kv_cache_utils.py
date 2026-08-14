@@ -2319,6 +2319,72 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+def _dspark_style_specs(num_target_layers: int, num_draft_layers: int):
+    """A hybrid mamba/MLA target plus an MLA-only drafter, at one page size."""
+    draft_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float32,
+        non_causal_multi_token_decode=True,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        # 9216 * 4 bytes matches new_mla_spec's 16 * 576 * 4 page.
+        shapes=((9216,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="all",
+    )
+    assert mamba_spec.page_size_bytes == new_mla_spec().page_size_bytes
+    specs: dict[str, Any] = {}
+    for i in range(num_target_layers):
+        specs[f"model.layers.{i}.self_attn"] = new_mla_spec()
+        specs[f"model.layers.{i}.linear_attn"] = mamba_spec
+    for i in range(num_draft_layers):
+        specs[f"drafter.layers.{i}.self_attn"] = draft_spec
+    return specs
+
+
+def test_drafter_bucket_does_not_decide_hybrid_group_size():
+    """A drafter's own attention type must not set the target's group size.
+
+    The DSpark draft is MLA-only and has far fewer layers than the target, so
+    letting its bucket pick ``group_size = min(bucket sizes)`` would split the
+    target's layers one group per layer -- and would group them differently
+    depending on whether the engine holds the drafter, which breaks KV transfer
+    in PD-disaggregated serving.
+    """
+    groups = get_kv_cache_groups(_grouping_config(), _dspark_style_specs(4, 1))
+
+    # One group per attention type, at the target's group size of 4.
+    assert len(groups) == 3
+    sizes = sorted(len(group.layer_names) for group in groups)
+    assert sizes == [1, 4, 4]
+    draft_group = next(
+        group
+        for group in groups
+        if getattr(group.kv_cache_spec, "non_causal_multi_token_decode", False)
+    )
+    assert draft_group.layer_names == ["drafter.layers.0.self_attn"]
+
+
+def test_drafter_bucket_is_excluded_from_both_group_size_bounds():
+    """A large drafter bucket must not set group_size through the heuristic.
+
+    ``max_num_layers < min_num_layers * 1.5`` promotes group_size to the largest
+    bucket. Excluding the drafter from the minimum but not the maximum would let
+    a drafter with more layers than the target decide the size after all.
+    """
+    groups = get_kv_cache_groups(_grouping_config(), _dspark_style_specs(4, 5))
+
+    target_sizes = [
+        len(group.layer_names)
+        for group in groups
+        if not getattr(group.kv_cache_spec, "non_causal_multi_token_decode", False)
+    ]
+    assert target_sizes == [4, 4]
+
+
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
     specs = {
         "target.0.attn": new_mla_spec(),
