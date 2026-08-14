@@ -418,9 +418,10 @@ class MLAAttentionSpec(FullAttentionSpec):
             "quantization method, compress ratio, model version, and KV block "
             "stride indexing."
         )
-        # The metadata builder reads this once per group, so mixing causal
-        # target layers with non-causal draft layers would route the target
-        # through the draft decode path.
+        # The flag drives how the whole group is served -- the metadata builder
+        # reads it once per group -- so a group that mixed marked and unmarked
+        # layers would apply the drafter's non-causal decode to causal target
+        # layers. Keep such layers in separate groups instead of merging them.
         non_causal_mtd_set = set(spec.non_causal_multi_token_decode for spec in specs)
         assert len(non_causal_mtd_set) == 1, (
             "All attention layers in the same KV cache group must agree on "

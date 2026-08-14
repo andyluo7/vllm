@@ -1258,9 +1258,25 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in layer_buckets])
+    bucket_sizes = [len(layers) for layers in layer_buckets]
+    # A drafter can add its own attention type with far fewer layers than the
+    # target (e.g. an MLA-only draft on a hybrid mamba/attention target). Letting
+    # that bucket decide group_size over-splits the target's layers, and makes an
+    # engine that holds the drafter group its mamba layers differently from one
+    # that does not, breaking PD-disaggregated KV transfer. Draft layers are few,
+    # so padding them up to the target's group size is cheap. A bucket is
+    # homogeneous in this marker: specs that disagree on it cannot be merged.
+    primary_sizes = [
+        len(layers)
+        for layers, specs in zip(layer_buckets, spec_buckets)
+        if not getattr(specs[0], "non_causal_multi_token_decode", False)
+    ] or bucket_sizes
+    # Both bounds have to come from the same set of buckets, or a drafter bucket
+    # that happens to be the largest would set group_size through the heuristic
+    # below and reintroduce the dependence this excludes it to avoid.
+    min_num_layers = min(primary_sizes)
+    max_num_layers = max(primary_sizes)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in layer_buckets])
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
