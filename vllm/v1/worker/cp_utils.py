@@ -37,6 +37,20 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            if dcp_size > 1 and getattr(layer_impl, "dcp_world_size", dcp_size) <= 1:
+                # A layer that pinned itself out of DCP keeps its KV replicated on
+                # every rank (the Kimi-K3 DSpark draft), so it never joins the
+                # cross-rank merge and needs neither a decode LSE nor interleaving.
+                # Only the V2 runner writes such a group's slot mapping unsharded;
+                # V1 would shard it and the layer would read a partial sequence.
+                if not vllm_config.use_v2_model_runner:
+                    raise NotImplementedError(
+                        f"{layer.__class__.__name__} keeps its KV cache replicated "
+                        "under decode context parallelism, which only the V2 model "
+                        "runner supports. Relaunch with VLLM_USE_V2_MODEL_RUNNER=1 "
+                        "or decode_context_parallel_size=1."
+                    )
+                continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "

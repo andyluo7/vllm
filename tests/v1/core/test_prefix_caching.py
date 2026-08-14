@@ -4333,3 +4333,68 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def _dcp_target_and_draft_kv_cache_config(
+    block_size: int, num_blocks: int
+) -> KVCacheConfig:
+    """A DCP-sharded MLA target group plus a replicated MLA draft group."""
+    spec_kwargs = dict(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], MLAAttentionSpec(**spec_kwargs)),
+            KVCacheGroupSpec(
+                ["draft"],
+                MLAAttentionSpec(**spec_kwargs, non_causal_multi_token_decode=True),
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize("dcp_world_size", [2, 4])
+def test_dcp_replicated_group_hit_uses_its_own_block_size(dcp_world_size: int):
+    """A replicated group's cache hit must be looked up at its own geometry.
+
+    The DSpark draft's KV cache is replicated on every DCP rank, so one of its
+    blocks holds ``block_size`` global tokens while one of the target's holds
+    ``block_size * dcp_world_size``. Looking both up at the sharded geometry
+    hands the draft group a block list covering a fraction of the tokens it
+    reports as computed.
+    """
+    block_size = 4
+    manager = make_kv_cache_manager(
+        _dcp_target_and_draft_kv_cache_config(block_size, 64),
+        max_model_len=8192,
+        enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=block_size * dcp_world_size,
+        hash_block_size=block_size,
+    )
+    target_manager, draft_manager = manager.coordinator.single_type_managers
+    assert target_manager.block_size == block_size * dcp_world_size
+    assert draft_manager.block_size == block_size
+
+    num_tokens = block_size * dcp_world_size * 3
+    token_ids = list(range(num_tokens))
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(req0, num_tokens, 0, computed) is not None
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens > 0, "the second request did not hit the cache"
+    for group_id, group_manager in enumerate((target_manager, draft_manager)):
+        num_hit_blocks = len(computed.blocks[group_id])
+        assert num_hit_blocks == num_computed_tokens // group_manager.block_size, (
+            f"group {group_id} reports {num_computed_tokens} computed tokens but "
+            f"returned {num_hit_blocks} blocks of {group_manager.block_size} tokens"
+        )

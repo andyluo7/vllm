@@ -141,7 +141,16 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                # Replicated draft groups keep dcp_world_size=1 block geometry.
+                dcp_world_size=(
+                    1
+                    if getattr(
+                        kv_cache_group.kv_cache_spec,
+                        "non_causal_multi_token_decode",
+                        False,
+                    )
+                    else dcp_world_size
+                ),
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
@@ -843,8 +852,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
+                    # Per group, not global: a replicated group's manager keeps
+                    # dcp_world_size=1, and the hit has to be looked up at the
+                    # same block geometry the group allocates with.
                     dcp_world_size=(
-                        self.dcp_world_size
+                        self.single_type_managers[first_group_id].dcp_world_size
                         if isinstance(spec, FullAttentionSpec)
                         else 1
                     ),

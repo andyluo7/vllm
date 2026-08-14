@@ -713,6 +713,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         reorder_batch_threshold: int | None = 1,
         supports_spec_as_decode: bool = False,
         supports_dcp_with_varlen: bool = False,
+        dcp_world_size: int | None = None,
     ) -> None:
         self.reorder_batch_threshold = reorder_batch_threshold
         if self.reorder_batch_threshold is not None and supports_spec_as_decode:
@@ -734,10 +735,14 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                     max_num_queries_for_spec,
                 )
 
-        if (
-            self.vllm_config.parallel_config.decode_context_parallel_size > 1
-            and not supports_dcp_with_varlen
-        ):
+        # The runner reduces this over all groups with min, so a group that does
+        # not have a DCP-sharded KV cache must not clamp the others: pass its own
+        # world size (1 for a replicated group) rather than the global one.
+        if dcp_world_size is None:
+            dcp_world_size = (
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            )
+        if dcp_world_size > 1 and not supports_dcp_with_varlen:
             self.reorder_batch_threshold = 1
 
     @abstractmethod

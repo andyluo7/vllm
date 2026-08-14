@@ -2041,11 +2041,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
     def _validate_dspark_dcp_support(self, supports_dcp_with_varlen: bool) -> None:
         speculative_config = getattr(self.vllm_config, "speculative_config", None)
-        parallel_config = self.vllm_config.parallel_config
         if (
             speculative_config is None
             or getattr(speculative_config, "method", None) != "dspark"
-            or parallel_config.decode_context_parallel_size <= 1
+            # Per group, not global: a group whose KV is replicated on every rank
+            # sees whole sequences locally and never joins the cross-rank merge,
+            # so no backend capability is needed from it.
+            or self.dcp_world_size <= 1
         ):
             return
 
@@ -2157,6 +2159,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.non_causal_multi_token_decode = getattr(
             kv_cache_spec, "non_causal_multi_token_decode", False
         )
+
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+        # Replicated draft groups (non_causal_multi_token_decode) use whole-sequence
+        # metadata and do not participate in the target's DCP merge.
+        if self.non_causal_multi_token_decode:
+            self.dcp_world_size = 1
+        self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
+        self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+
         self._validate_dspark_dcp_support(supports_dcp_with_varlen)
 
         # A draft cache group can have a different head count from the target.
@@ -2179,15 +2195,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             vllm_config, self.model_config.dtype
         )
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
-
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
-        self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
-        self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
-        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
 
         self.page_size = self.kv_cache_spec.block_size
 
@@ -2237,7 +2244,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
         self._init_reorder_batch_threshold(
-            self.reorder_batch_threshold, supports_spec_decode, supports_dcp_with_varlen
+            self.reorder_batch_threshold,
+            supports_spec_decode,
+            supports_dcp_with_varlen,
+            self.dcp_world_size,
         )
 
         if self.query_len_support == QueryLenSupport.SINGLE_ONLY:
