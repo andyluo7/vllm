@@ -32,6 +32,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
 
+# Token tile for the page-index expansion grid.
+_EXPAND_PAGE_BLOCK = 1024
+
 
 @functools.lru_cache(maxsize=1)
 def _get_mla_gluon():
@@ -448,6 +451,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             )
         self._shared_schedule_needs_build = False
 
+    reusable_metadata_buffers: ClassVar[tuple[str, ...]] = (
+        "_mla_work_indptr",
+        "_mla_work_info_set",
+        "_mla_reduce_indptr",
+        "_mla_reduce_final_map",
+        "_mla_reduce_partial_map",
+        "paged_kv_indptr",
+        "qo_indptr",
+    )
+
     def share_reusable_metadata_buffers(
         self, source: "AiterMLAMetadataBuilder"
     ) -> None:
@@ -460,25 +473,29 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         """
         if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             return
-        schedule_names = (
-            "_mla_work_indptr",
-            "_mla_work_info_set",
-            "_mla_reduce_indptr",
-            "_mla_reduce_final_map",
-            "_mla_reduce_partial_map",
-            "paged_kv_indptr",
-            "qo_indptr",
-        )
         if self._mla_work_indptr.data_ptr() == source._mla_work_indptr.data_ptr():
             return
-        for name in schedule_names:
-            destination = getattr(self, name)
-            shared = getattr(source, name)
-            assert destination.shape == shared.shape
-            assert destination.dtype == shared.dtype
-            assert destination.device == shared.device
-            setattr(self, name, shared)
+        super().share_reusable_metadata_buffers(source)
         self._shared_schedule_needs_build = True
+
+    def can_reuse_metadata(self, metadata: AiterMLAMetadata) -> bool:
+        """Reuse only once this builder has rebuilt against the shared schedule.
+
+        ``share_reusable_metadata_buffers`` rebinds the schedule storage but
+        leaves ``work_meta_data`` holding addresses into the old allocation.
+        One full build after rebinding re-derives it; until then, and whenever
+        the schedule was never shared (the MRV1 runner does not share), a
+        normal build is required.
+        """
+        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return True
+        if self._shared_schedule_needs_build:
+            return False
+        return metadata.decode is None or (
+            metadata.decode.paged_kv_indptr is not None
+            and self.paged_kv_indptr.data_ptr()
+            == metadata.decode.paged_kv_indptr.data_ptr()
+        )
 
     def get_metadata_reuse_key(self) -> tuple[object, ...]:
         return (
@@ -774,7 +791,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             block_table_tensor.stride(0),
             paged_kv_indptr,
             KERNEL_BLOCK_SIZE=self.kernel_block_size,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=_EXPAND_PAGE_BLOCK,
         )
         paged_kv_indices = self.paged_kv_indices
 
@@ -976,9 +993,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 decode.block_table.stride(0),
                 decode.paged_kv_indptr,
                 KERNEL_BLOCK_SIZE=self.kernel_block_size,
-                BLOCK_SIZE=1024,
+                BLOCK_SIZE=_EXPAND_PAGE_BLOCK,
             )
-
             if shared_graph_schedule:
                 decode.paged_kv_last_page_len = self.paged_kv_last_page_len[
                     : metadata.num_decodes
