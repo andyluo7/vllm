@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     MooncakeStoreCoordinator,
     effective_kv_cache_groups,
     partial_hash_hits_enabled,
+    unwrap_kv_cache_spec,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     chunk_hashes_for_block_size,
@@ -20,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 
@@ -93,6 +95,42 @@ def test_effective_kv_cache_groups_replicates_mamba():
     scaled = effective_kv_cache_groups(groups, 8)
 
     assert [g.kv_cache_spec.block_size for g in scaled] == [128, 128]
+
+
+def test_uniform_group_uses_effective_dcp_geometry_for_cache_hits():
+    inner = _full(block_size=16)
+    raw_groups = [
+        KVCacheGroupSpec(
+            ["attention"],
+            UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={"attention": inner},
+            ),
+        )
+    ]
+    groups = effective_kv_cache_groups(raw_groups, dcp_world_size=8)
+    effective_inner = unwrap_kv_cache_spec(groups[0].kv_cache_spec)
+
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=128,
+        hash_block_size=16,
+        dcp_world_size=8,
+    )
+    hashes = _hashes(8)
+    cached = ExternalCachedBlockPool(16, {(0, bytes(hashes[-1]))})
+
+    _masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=128,
+        cached_block_pool=cached,
+    )
+
+    assert hit == 128
+    assert groups[0].kv_cache_spec.block_size == 128
+    assert effective_inner.block_size == 128
+    # The effective view must not mutate the model's original layer spec.
+    assert inner.block_size == 16
 
 
 # ----- ExternalCachedBlockPool -----
