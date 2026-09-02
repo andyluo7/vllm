@@ -25,7 +25,10 @@ from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import (
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
     GDNAttentionMetadata,
@@ -473,9 +476,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         "num_accepted_tokens",
     )
 
-    def share_reusable_metadata_buffers(
-        self, source: "KimiK3KDAMetadataBuilder"
-    ) -> None:
+    def share_reusable_metadata_buffers(self, source: AttentionMetadataBuilder) -> None:
         """Share only common, read-only-at-execution graph inputs.
 
         State indices remain local because each KDA cache group owns a
@@ -488,12 +489,14 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         # stages into its own buffer; sharing would make them collide.
         if self.use_recoverssm:
             return
+        assert isinstance(source, KimiK3KDAMetadataBuilder)
         super().share_reusable_metadata_buffers(source)
 
-    def can_reuse_metadata(self, metadata: KimiK3KDAMetadata) -> bool:
+    def can_reuse_metadata(self, metadata: GDNAttentionMetadata) -> bool:
         """Limit the fast path to uniform speculative FULL-graph decode."""
         return (
-            self.use_full_cuda_graph
+            isinstance(metadata, KimiK3KDAMetadata)
+            and self.use_full_cuda_graph
             # recoverssm collapses spec_state_slots to 1 and owns its own
             # commit path; leave that regime on the normal build.
             and not self.use_recoverssm
@@ -513,11 +516,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def update_block_table(
         self,
-        metadata: KimiK3KDAMetadata,
+        metadata: GDNAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> KimiK3KDAMetadata:
         """Reuse batch-common decode metadata for another KDA cache group."""
+        assert isinstance(metadata, KimiK3KDAMetadata)
         assert self.can_reuse_metadata(metadata)
         assert metadata.state_seq_lens is not None
         assert metadata.spec_state_indices_tensor is not None

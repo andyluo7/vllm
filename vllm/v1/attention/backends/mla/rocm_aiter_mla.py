@@ -25,6 +25,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
+    AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
 )
@@ -461,9 +462,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         "qo_indptr",
     )
 
-    def share_reusable_metadata_buffers(
-        self, source: "AiterMLAMetadataBuilder"
-    ) -> None:
+    def share_reusable_metadata_buffers(self, source: AttentionMetadataBuilder) -> None:
         """Share graph-stable numeric schedule storage across compatible groups.
 
         The schedule is read-only during MLA execution and depends on request
@@ -473,6 +472,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         """
         if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             return
+        assert isinstance(source, AiterMLAMetadataBuilder)
         if self._mla_work_indptr.data_ptr() == source._mla_work_indptr.data_ptr():
             return
         super().share_reusable_metadata_buffers(source)

@@ -681,7 +681,7 @@ def test_reused_kda_metadata_uses_shared_common_and_group_local_graph_buffers(
         num_accepted_tokens=accepted,
         num_decode_draft_tokens_cpu=drafts,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     torch.testing.assert_close(
         reused_metadata.spec_state_indices_tensor,
         reference_metadata.spec_state_indices_tensor,
@@ -729,7 +729,7 @@ def test_reused_kda_metadata_uses_shared_common_and_group_local_graph_buffers(
     )
     source_graph.replay()
     reused_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.testing.assert_close(
         source_state, source_metadata.spec_state_indices_tensor, rtol=0, atol=0

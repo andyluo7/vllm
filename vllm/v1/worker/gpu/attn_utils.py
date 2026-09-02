@@ -374,10 +374,9 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
-            reuse_cache[cache_key] = (
-                attn_metadata_builder,
-                cached_metadata if can_reuse else metadata,
-            )
+            metadata_to_cache = cached_metadata if can_reuse else metadata
+            assert metadata_to_cache is not None
+            reuse_cache[cache_key] = (attn_metadata_builder, metadata_to_cache)
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
